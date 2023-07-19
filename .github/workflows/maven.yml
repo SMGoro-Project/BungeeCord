@@ -28,4 +28,4 @@ jobs:
 
         name: BungeeCord
 
-        path: "target/*.jar"
+        path: "*/target/*.jar"
