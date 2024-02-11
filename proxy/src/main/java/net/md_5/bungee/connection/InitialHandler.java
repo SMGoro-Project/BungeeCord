@@ -1,6 +1,5 @@
 package net.md_5.bungee.connection;
 
-import com.google.common.base.Charsets;
 import com.google.common.base.Preconditions;
 import com.google.gson.Gson;
 import java.math.BigInteger;
@@ -12,12 +11,19 @@ import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 import javax.crypto.SecretKey;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.ToString;
 import net.md_5.bungee.BungeeCord;
 import net.md_5.bungee.BungeeServerInfo;
 import net.md_5.bungee.EncryptionUtil;
@@ -39,7 +45,6 @@ import net.md_5.bungee.api.event.PostLoginEvent;
 import net.md_5.bungee.api.event.PreLoginEvent;
 import net.md_5.bungee.api.event.ProxyPingEvent;
 import net.md_5.bungee.api.event.ServerConnectEvent;
-import net.md_5.bungee.chat.ComponentSerializer;
 import net.md_5.bungee.http.HttpClient;
 import net.md_5.bungee.jni.cipher.BungeeCipher;
 import net.md_5.bungee.netty.ChannelWrapper;
@@ -53,6 +58,8 @@ import net.md_5.bungee.protocol.PacketWrapper;
 import net.md_5.bungee.protocol.PlayerPublicKey;
 import net.md_5.bungee.protocol.Protocol;
 import net.md_5.bungee.protocol.ProtocolConstants;
+import net.md_5.bungee.protocol.packet.CookieRequest;
+import net.md_5.bungee.protocol.packet.CookieResponse;
 import net.md_5.bungee.protocol.packet.EncryptionRequest;
 import net.md_5.bungee.protocol.packet.EncryptionResponse;
 import net.md_5.bungee.protocol.packet.Handshake;
@@ -88,6 +95,19 @@ public class InitialHandler extends PacketHandler implements PendingConnection
     @Getter
     private final Set<String> registeredChannels = new HashSet<>();
     private State thisState = State.HANDSHAKE;
+    private final Queue<CookieFuture> requestedCookies = new LinkedList<>();
+
+    @Data
+    @ToString
+    @EqualsAndHashCode
+    @AllArgsConstructor
+    public static class CookieFuture
+    {
+
+        private String cookie;
+        private CompletableFuture<byte[]> future;
+    }
+
     private final Unsafe unsafe = new Unsafe()
     {
         @Override
@@ -111,6 +131,9 @@ public class InitialHandler extends PacketHandler implements PendingConnection
     private boolean legacy;
     @Getter
     private String extraDataInHandshake = "";
+    @Getter
+    private boolean transferred;
+    private UserConnection userCon;
 
     @Override
     public boolean shouldHandle(PacketWrapper packet) throws Exception
@@ -350,6 +373,8 @@ public class InitialHandler extends PacketHandler implements PendingConnection
                 ch.setProtocol( Protocol.STATUS );
                 break;
             case 2:
+            case 3:
+                transferred = handshake.getRequestedProtocol() == 3;
                 // Login
                 bungee.getLogger().log( Level.INFO, "{0} has connected", this );
                 thisState = State.USERNAME;
@@ -364,6 +389,12 @@ public class InitialHandler extends PacketHandler implements PendingConnection
                     {
                         disconnect( bungee.getTranslation( "outdated_client", bungee.getGameVersion() ) );
                     }
+                    return;
+                }
+
+                if ( transferred && bungee.config.isRejectTransfers() )
+                {
+                    disconnect( bungee.getTranslation( "reject_transfer" ) );
                     return;
                 }
                 break;
@@ -433,8 +464,8 @@ public class InitialHandler extends PacketHandler implements PendingConnection
             {
                 if ( result.isCancelled() )
                 {
-                    BaseComponent[] reason = result.getCancelReasonComponents();
-                    disconnect( ( reason != null ) ? reason : TextComponent.fromLegacyText( bungee.getTranslation( "kick_message" ) ) );
+                    BaseComponent reason = result.getReason();
+                    disconnect( ( reason != null ) ? reason : TextComponent.fromLegacy( bungee.getTranslation( "kick_message" ) ) );
                     return;
                 }
                 if ( ch.isClosed() )
@@ -514,7 +545,7 @@ public class InitialHandler extends PacketHandler implements PendingConnection
 
     private void finish()
     {
-        offlineId = UUID.nameUUIDFromBytes( ( "OfflinePlayer:" + getName() ).getBytes( Charsets.UTF_8 ) );
+        offlineId = UUID.nameUUIDFromBytes( ( "OfflinePlayer:" + getName() ).getBytes( StandardCharsets.UTF_8 ) );
         if ( uniqueId == null )
         {
             uniqueId = offlineId;
@@ -577,8 +608,8 @@ public class InitialHandler extends PacketHandler implements PendingConnection
             {
                 if ( result.isCancelled() )
                 {
-                    BaseComponent[] reason = result.getCancelReasonComponents();
-                    disconnect( ( reason != null ) ? reason : TextComponent.fromLegacyText( bungee.getTranslation( "kick_message" ) ) );
+                    BaseComponent reason = result.getReason();
+                    disconnect( ( reason != null ) ? reason : TextComponent.fromLegacy( bungee.getTranslation( "kick_message" ) ) );
                     return;
                 }
                 if ( ch.isClosed() )
@@ -593,29 +624,15 @@ public class InitialHandler extends PacketHandler implements PendingConnection
                     {
                         if ( !ch.isClosing() )
                         {
-                            UserConnection userCon = new UserConnection( bungee, ch, getName(), InitialHandler.this );
+                            userCon = new UserConnection( bungee, ch, getName(), InitialHandler.this );
                             userCon.setCompressionThreshold( BungeeCord.getInstance().config.getCompressionThreshold() );
-                            userCon.init();
 
-                            unsafe.sendPacket( new LoginSuccess( getUniqueId(), getName(), ( loginProfile == null ) ? null : loginProfile.getProperties() ) );
-                            ch.setProtocol( Protocol.GAME );
-
-                            ch.getHandle().pipeline().get( HandlerBoss.class ).setHandler( new UpstreamBridge( bungee, userCon ) );
-                            bungee.getPluginManager().callEvent( new PostLoginEvent( userCon ) );
-                            ServerInfo server;
-                            if ( bungee.getReconnectHandler() != null )
+                            if ( getVersion() < ProtocolConstants.MINECRAFT_1_20_2 )
                             {
-                                server = bungee.getReconnectHandler().getServer( userCon );
-                            } else
-                            {
-                                server = AbstractReconnectHandler.getForcedHost( InitialHandler.this );
+                                unsafe.sendPacket( new LoginSuccess( getUniqueId(), getName(), ( loginProfile == null ) ? null : loginProfile.getProperties() ) );
+                                ch.setProtocol( Protocol.GAME );
                             }
-                            if ( server == null )
-                            {
-                                server = bungee.getServerInfo( listener.getDefaultServer() );
-                            }
-
-                            userCon.connect( server, null, true, ServerConnectEvent.Reason.JOIN_PROXY );
+                            finish2();
                         }
                     }
                 } );
@@ -626,6 +643,39 @@ public class InitialHandler extends PacketHandler implements PendingConnection
         bungee.getPluginManager().callEvent( new LoginEvent( InitialHandler.this, complete ) );
     }
 
+    private void finish2()
+    {
+        if ( !userCon.init() )
+        {
+            disconnect( bungee.getTranslation( "already_connected_proxy" ) );
+            return;
+        }
+
+        ch.getHandle().pipeline().get( HandlerBoss.class ).setHandler( new UpstreamBridge( bungee, userCon ) );
+        bungee.getPluginManager().callEvent( new PostLoginEvent( userCon ) );
+
+        // #3612: Don't progress further if disconnected during event
+        if ( ch.isClosed() )
+        {
+            return;
+        }
+
+        ServerInfo server;
+        if ( bungee.getReconnectHandler() != null )
+        {
+            server = bungee.getReconnectHandler().getServer( userCon );
+        } else
+        {
+            server = AbstractReconnectHandler.getForcedHost( InitialHandler.this );
+        }
+        if ( server == null )
+        {
+            server = bungee.getServerInfo( listener.getDefaultServer() );
+        }
+
+        userCon.connect( server, null, true, ServerConnectEvent.Reason.JOIN_PROXY );
+    }
+
     @Override
     public void handle(LoginPayloadResponse response) throws Exception
     {
@@ -633,11 +683,39 @@ public class InitialHandler extends PacketHandler implements PendingConnection
     }
 
     @Override
+    public void handle(CookieResponse cookieResponse)
+    {
+        // be careful, backend server could also make the client send a cookie response
+        CookieFuture future;
+        synchronized ( requestedCookies )
+        {
+            future = requestedCookies.peek();
+            if ( future != null )
+            {
+                if ( future.cookie.equals( cookieResponse.getCookie() ) )
+                {
+                    Preconditions.checkState( future == requestedCookies.poll(), "requestedCookies queue mismatch" );
+                } else
+                {
+                    future = null; // leave for handling by backend
+                }
+            }
+        }
+
+        if ( future != null )
+        {
+            future.getFuture().complete( cookieResponse.getData() );
+
+            throw CancelSendSignal.INSTANCE;
+        }
+    }
+
+    @Override
     public void disconnect(String reason)
     {
         if ( canSendKickMessage() )
         {
-            disconnect( TextComponent.fromLegacyText( reason ) );
+            disconnect( TextComponent.fromLegacy( reason ) );
         } else
         {
             ch.close();
@@ -647,22 +725,19 @@ public class InitialHandler extends PacketHandler implements PendingConnection
     @Override
     public void disconnect(final BaseComponent... reason)
     {
-        if ( canSendKickMessage() )
-        {
-            ch.delayedClose( new Kick( ComponentSerializer.toString( reason ) ) );
-        } else
-        {
-            ch.close();
-        }
+        disconnect( TextComponent.fromArray( reason ) );
     }
 
     @Override
     public void disconnect(BaseComponent reason)
     {
-        disconnect( new BaseComponent[]
+        if ( canSendKickMessage() )
         {
-            reason
-        } );
+            ch.delayedClose( new Kick( reason ) );
+        } else
+        {
+            ch.close();
+        }
     }
 
     @Override
@@ -766,5 +841,27 @@ public class InitialHandler extends PacketHandler implements PendingConnection
         {
             brandMessage = input;
         }
+    }
+
+    @Override
+    public CompletableFuture<byte[]> retrieveCookie(String cookie)
+    {
+        Preconditions.checkState( getVersion() >= ProtocolConstants.MINECRAFT_1_20_5, "Cookies are only supported in 1.20.5 and above" );
+        Preconditions.checkState( loginRequest != null, "Cannot retrieve cookies for status or legacy connections" );
+
+        if ( cookie.indexOf( ':' ) == -1 )
+        {
+            // if we request an invalid resource location (no prefix) the client will respond with "minecraft:" prefix
+            cookie = "minecraft:" + cookie;
+        }
+
+        CompletableFuture<byte[]> future = new CompletableFuture<>();
+        synchronized ( requestedCookies )
+        {
+            requestedCookies.add( new CookieFuture( cookie, future ) );
+        }
+        unsafe.sendPacket( new CookieRequest( cookie ) );
+
+        return future;
     }
 }
